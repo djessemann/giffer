@@ -72,14 +72,33 @@
 
   <footer><a href="https://github.com/djessemann/giffer">source on github</a></footer>
 
-  <script src="coi-serviceworker.js"></script>
-  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
-  <script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
   <script>
-  (function () {
-    const CORE = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
-    const { FFmpeg } = FFmpegWASM;
-    const { fetchFile, toBlobURL } = FFmpegUtil;
+  // Older versions of this app installed a service worker (for ffmpeg.wasm).
+  // It sets cross-origin-isolation headers that block the CDN module below,
+  // so remove any leftover worker and reload once into a clean state.
+  if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+    navigator.serviceWorker.getRegistrations()
+      .then(function (rs) { return Promise.all(rs.map(function (r) { return r.unregister(); })); })
+      .finally(function () {
+        if (!sessionStorage.getItem("swCleared")) {
+          sessionStorage.setItem("swCleared", "1");
+          location.reload();
+        }
+      });
+  } else if (navigator.serviceWorker) {
+    navigator.serviceWorker.getRegistrations()
+      .then(function (rs) { rs.forEach(function (r) { r.unregister(); }); });
+  }
+  </script>
+
+  <script type="module">
+  import { GIFEncoder, quantize, applyPalette } from "https://unpkg.com/gifenc@1.0.3/dist/gifenc.esm.js";
+
+  // If a leftover service worker is still controlling this load, the page is
+  // about to reload itself (see above) — don't bother wiring up the app.
+  if (!(navigator.serviceWorker && navigator.serviceWorker.controller)) {
+    const FPS = 15;
+    const MAX_WIDTH = 640;
 
     const pick = document.getElementById("pick");
     const fileInput = document.getElementById("file");
@@ -88,29 +107,37 @@
     const preview = document.getElementById("preview");
     const download = document.getElementById("download");
 
-    let ffmpeg = null;
+    const setStatus = (t) => { statusEl.textContent = t; };
+    const tick = () => new Promise((r) => requestAnimationFrame(() => r()));
 
-    function setStatus(t) { statusEl.textContent = t; }
+    // Seek the video to time t (seconds) and resolve once the frame is ready.
+    function seek(video, t) {
+      return new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          video.removeEventListener("seeked", finish);
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(finish, 3000); // never hang on a stubborn frame
+        video.addEventListener("seeked", finish);
+        // Nudge if we're already at t, otherwise "seeked" may never fire.
+        video.currentTime = Math.abs(video.currentTime - t) < 1e-3 ? t + 1e-3 : t;
+      });
+    }
 
-    async function ensureLoaded() {
-      if (ffmpeg) return ffmpeg;
-      if (!window.crossOriginIsolated) {
-        // coi-serviceworker reloads the page once to enable this; if we get
-        // here it failed, so bail with a clear message.
-        throw new Error("Couldn't enable the in-browser converter. Reload the page and try again.");
-      }
-      setStatus("Loading converter… (one-time, ~30 MB)");
-      ffmpeg = new FFmpeg();
-      ffmpeg.on("progress", function (e) {
-        if (e.progress >= 0 && e.progress <= 1) {
-          setStatus("Converting… " + Math.round(e.progress * 100) + "%");
-        }
+    function loadVideo(file) {
+      return new Promise((resolve, reject) => {
+        const video = document.createElement("video");
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = "auto";
+        video.src = URL.createObjectURL(file);
+        video.onloadeddata = () => resolve(video);
+        video.onerror = () => reject(new Error("Couldn't read that video file."));
       });
-      await ffmpeg.load({
-        coreURL: await toBlobURL(CORE + "/ffmpeg-core.js", "text/javascript"),
-        wasmURL: await toBlobURL(CORE + "/ffmpeg-core.wasm", "application/wasm"),
-      });
-      return ffmpeg;
     }
 
     async function convert(file) {
@@ -118,37 +145,46 @@
       resultEl.style.display = "none";
       preview.removeAttribute("src");
       download.removeAttribute("href");
+      setStatus("Reading video…");
 
+      let video;
       try {
-        const ff = await ensureLoaded();
+        video = await loadVideo(file);
+        const duration = video.duration;
+        if (!isFinite(duration) || duration <= 0) {
+          throw new Error("Couldn't read the video's length.");
+        }
+        // Prime the decoder — some browsers (esp. iOS) need a play tick before
+        // they'll paint frames to a canvas.
+        try { await video.play(); video.pause(); } catch (e) {}
 
-        const ext = (file.name.split(".").pop() || "mp4").toLowerCase();
-        const inName = "input." + ext;
-        await ff.writeFile(inName, await fetchFile(file));
+        const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
+        const w = Math.max(2, Math.round((video.videoWidth * scale) / 2) * 2);
+        const h = Math.max(2, Math.round((video.videoHeight * scale) / 2) * 2);
 
-        // Two-pass palette conversion: generate an optimal 256-color palette
-        // from the whole clip, then apply it with dithering for clarity.
-        // fps 15 keeps motion smooth; width capped at 640 for sharp but
-        // sensibly-sized output on short clips.
-        const vf = "fps=15,scale='min(640,iw)':-2:flags=lanczos";
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
-        setStatus("Analyzing colors…");
-        await ff.exec([
-          "-i", inName,
-          "-vf", vf + ",palettegen=stats_mode=diff",
-          "-y", "palette.png",
-        ]);
+        const total = Math.max(1, Math.min(600, Math.floor(duration * FPS)));
+        const delay = Math.round(1000 / FPS);
+        const gif = GIFEncoder();
 
-        setStatus("Converting…");
-        await ff.exec([
-          "-i", inName,
-          "-i", "palette.png",
-          "-filter_complex", vf + "[x];[x][1:v]paletteuse=dither=sierra2_4a:diff_mode=rectangle",
-          "-y", "out.gif",
-        ]);
+        for (let i = 0; i < total; i++) {
+          await seek(video, Math.min(duration - 1e-3, i / FPS));
+          ctx.drawImage(video, 0, 0, w, h);
+          const { data } = ctx.getImageData(0, 0, w, h);
+          // Per-frame optimal 256-color palette → sharp, clear output.
+          const palette = quantize(data, 256, { format: "rgb565" });
+          const index = applyPalette(data, palette, "rgb565");
+          gif.writeFrame(index, w, h, { palette, delay });
+          setStatus("Converting… " + Math.round(((i + 1) / total) * 100) + "%");
+          await tick(); // keep the UI responsive
+        }
 
-        const data = await ff.readFile("out.gif");
-        const blob = new Blob([data.buffer], { type: "image/gif" });
+        gif.finish();
+        const blob = new Blob([gif.bytes()], { type: "image/gif" });
         const url = URL.createObjectURL(blob);
 
         preview.src = url;
@@ -158,34 +194,32 @@
 
         const kb = blob.size / 1024;
         setStatus("Done — " + (kb > 1024 ? (kb / 1024).toFixed(1) + " MB" : Math.round(kb) + " KB"));
-
-        // clean up the virtual filesystem for the next run
-        try { await ff.deleteFile(inName); await ff.deleteFile("palette.png"); await ff.deleteFile("out.gif"); } catch (e) {}
       } catch (err) {
         console.error(err);
         setStatus("Error: " + (err && err.message ? err.message : err));
       } finally {
+        if (video) URL.revokeObjectURL(video.src);
         pick.classList.remove("busy");
       }
     }
 
-    fileInput.addEventListener("change", function () {
+    fileInput.addEventListener("change", () => {
       const f = fileInput.files && fileInput.files[0];
       if (f) convert(f);
       fileInput.value = ""; // allow re-picking the same file
     });
 
     // Drag a video file onto the "Upload video" button to add it.
-    ["dragenter", "dragover"].forEach(function (ev) {
-      pick.addEventListener(ev, function (e) {
+    ["dragenter", "dragover"].forEach((ev) =>
+      pick.addEventListener(ev, (e) => {
         e.preventDefault();
         if (!pick.classList.contains("busy")) pick.classList.add("dragover");
-      });
-    });
-    ["dragleave", "dragend", "drop"].forEach(function (ev) {
-      pick.addEventListener(ev, function () { pick.classList.remove("dragover"); });
-    });
-    pick.addEventListener("drop", function (e) {
+      })
+    );
+    ["dragleave", "dragend", "drop"].forEach((ev) =>
+      pick.addEventListener(ev, () => pick.classList.remove("dragover"))
+    );
+    pick.addEventListener("drop", (e) => {
       e.preventDefault();
       if (pick.classList.contains("busy")) return;
       const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
@@ -198,9 +232,9 @@
     });
 
     // Don't let a missed drop navigate away from the page.
-    window.addEventListener("dragover", function (e) { e.preventDefault(); });
-    window.addEventListener("drop", function (e) { e.preventDefault(); });
-  })();
+    window.addEventListener("dragover", (e) => e.preventDefault());
+    window.addEventListener("drop", (e) => e.preventDefault());
+  }
   </script>
 </body>
 </html>

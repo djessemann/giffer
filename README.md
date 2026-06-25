@@ -4,11 +4,11 @@ Dead-simple web app: upload a short video, get a high-quality GIF you can downlo
 
 **Live app → https://djessemann.github.io/giffer/**
 
-Everything runs in your browser via [ffmpeg.wasm](https://ffmpegwasm.netlify.app/) — no video is ever uploaded to a server. Conversion uses a two-pass palette (`palettegen` + `paletteuse` with dithering) at 15 fps for clear, smooth output, best for clips of ~10 seconds or less.
+Everything runs in your browser — no video is ever uploaded to a server. Frames are captured from the video via canvas and encoded with [gifenc](https://github.com/mattdesl/gifenc), each frame quantized to an optimal 256-color palette at 15 fps for clear, smooth output. Best for clips of ~10 seconds or less. No plugins, no WebAssembly download, works on mobile.
 
 ## Run locally
 
-It's a static site, but ffmpeg.wasm needs cross-origin isolation, so open it over HTTP rather than `file://`:
+It's a static site. Open it over HTTP rather than `file://` (so the CDN module loads):
 
 ```sh
 python3 -m http.server 8080
