@@ -33,7 +33,7 @@
     transition: border-color .15s, background .15s;
     background: #16181d;
   }
-  label.upload:hover { border-color: #6b7280; background: #1b1e24; }
+  label.upload:hover, label.upload.dragover { border-color: #4f8cff; background: #1b1e24; }
   label.upload.busy { opacity: .5; pointer-events: none; }
   input[type=file] { display: none; }
   #status { min-height: 1.5rem; color: #9aa0a6; font-variant-numeric: tabular-nums; }
@@ -55,11 +55,11 @@
 </head>
 <body>
   <h1>giffer</h1>
-  <p class="sub">Pick a short video. It's converted to a high-quality GIF right here in your browser — nothing is uploaded to a server.</p>
+  <p class="sub">Convert a video to a GIF.</p>
 
   <label class="upload" id="pick">
     <input type="file" id="file" accept="video/*" />
-    Choose a video
+    Upload video
   </label>
 
   <div id="status"></div>
@@ -174,6 +174,32 @@
       if (f) convert(f);
       fileInput.value = ""; // allow re-picking the same file
     });
+
+    // Drag a video file onto the "Upload video" button to add it.
+    ["dragenter", "dragover"].forEach(function (ev) {
+      pick.addEventListener(ev, function (e) {
+        e.preventDefault();
+        if (!pick.classList.contains("busy")) pick.classList.add("dragover");
+      });
+    });
+    ["dragleave", "dragend", "drop"].forEach(function (ev) {
+      pick.addEventListener(ev, function () { pick.classList.remove("dragover"); });
+    });
+    pick.addEventListener("drop", function (e) {
+      e.preventDefault();
+      if (pick.classList.contains("busy")) return;
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!f) return;
+      if (f.type && f.type.indexOf("video/") !== 0) {
+        setStatus("That doesn't look like a video file.");
+        return;
+      }
+      convert(f);
+    });
+
+    // Don't let a missed drop navigate away from the page.
+    window.addEventListener("dragover", function (e) { e.preventDefault(); });
+    window.addEventListener("drop", function (e) { e.preventDefault(); });
   })();
   </script>
 </body>
