@@ -110,34 +110,125 @@
     const setStatus = (t) => { statusEl.textContent = t; };
     const tick = () => new Promise((r) => requestAnimationFrame(() => r()));
 
-    // Seek the video to time t (seconds) and resolve once the frame is ready.
-    function seek(video, t) {
-      return new Promise((resolve) => {
-        let done = false;
-        const finish = () => {
-          if (done) return;
-          done = true;
-          video.removeEventListener("seeked", finish);
-          clearTimeout(timer);
-          resolve();
-        };
-        const timer = setTimeout(finish, 3000); // never hang on a stubborn frame
-        video.addEventListener("seeked", finish);
-        // Nudge if we're already at t, otherwise "seeked" may never fire.
-        video.currentTime = Math.abs(video.currentTime - t) < 1e-3 ? t + 1e-3 : t;
-      });
+    function quantizeFrame(ctx, gif, w, h, delay) {
+      const { data } = ctx.getImageData(0, 0, w, h);
+      // Per-frame optimal 256-color palette → sharp, clear output.
+      const palette = quantize(data, 256, { format: "rgb565" });
+      const index = applyPalette(data, palette, "rgb565");
+      gif.writeFrame(index, w, h, { palette, delay });
     }
 
+    // Load a video as robustly as possible. iOS in particular needs the
+    // element attached to the DOM, muted + playsinline, and an explicit
+    // load(); the timeout surfaces an error instead of hanging forever.
     function loadVideo(file) {
       return new Promise((resolve, reject) => {
         const video = document.createElement("video");
         video.muted = true;
+        video.defaultMuted = true;
         video.playsInline = true;
+        video.setAttribute("playsinline", "");
+        video.setAttribute("webkit-playsinline", "");
+        video.setAttribute("muted", "");
         video.preload = "auto";
+        video.style.cssText = "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;";
+        document.body.appendChild(video);
+
+        const timer = setTimeout(() => {
+          reject(new Error("Couldn't read that video — your browser may not support this format."));
+        }, 20000);
+        const ready = () => {
+          if (video.videoWidth > 0 && isFinite(video.duration) && video.duration > 0) {
+            clearTimeout(timer);
+            resolve(video);
+          }
+        };
+        ["loadedmetadata", "loadeddata", "canplay", "durationchange"].forEach((ev) =>
+          video.addEventListener(ev, ready)
+        );
+        video.onerror = () => {
+          clearTimeout(timer);
+          reject(new Error("Couldn't read that video — the format may be unsupported."));
+        };
         video.src = URL.createObjectURL(file);
-        video.onloadeddata = () => resolve(video);
-        video.onerror = () => reject(new Error("Couldn't read that video file."));
+        video.load();
       });
+    }
+
+    function destroyVideo(video) {
+      try { URL.revokeObjectURL(video.src); } catch (e) {}
+      try { video.removeAttribute("src"); video.load(); } catch (e) {}
+      if (video.parentNode) video.parentNode.removeChild(video);
+    }
+
+    // Preferred path: play the video and grab real rendered frames via
+    // requestVideoFrameCallback. Far more reliable than seeking on mobile.
+    function captureByPlayback(video, w, h, onProgress) {
+      return new Promise((resolve, reject) => {
+        const canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        const gif = GIFEncoder();
+        const interval = 1 / FPS;
+        const delay = Math.round(1000 / FPS);
+        let next = 0, count = 0, done = false;
+
+        const finish = () => {
+          if (done) return;
+          done = true;
+          if (count === 0) { try { ctx.drawImage(video, 0, 0, w, h); quantizeFrame(ctx, gif, w, h, delay); } catch (e) {} }
+          gif.finish();
+          resolve(gif.bytes());
+        };
+        const onFrame = (now, meta) => {
+          const t = meta ? meta.mediaTime : video.currentTime;
+          if (t + 1e-4 >= next) {
+            ctx.drawImage(video, 0, 0, w, h);
+            quantizeFrame(ctx, gif, w, h, delay);
+            count++;
+            next += interval;
+            onProgress(Math.min(0.99, t / video.duration));
+          }
+          if (video.ended) { finish(); return; }
+          video.requestVideoFrameCallback(onFrame);
+        };
+
+        video.addEventListener("ended", finish);
+        video.onerror = () => { if (!done) reject(new Error("Playback failed during conversion.")); };
+        video.currentTime = 0;
+        video.play()
+          .then(() => video.requestVideoFrameCallback(onFrame))
+          .catch(() => reject(new Error("Couldn't play the video for conversion.")));
+      });
+    }
+
+    // Fallback for browsers without requestVideoFrameCallback (e.g. Firefox):
+    // step through the clip by seeking.
+    async function captureBySeeking(video, w, h, onProgress) {
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      const gif = GIFEncoder();
+      const delay = Math.round(1000 / FPS);
+      const total = Math.max(1, Math.min(600, Math.floor(video.duration * FPS)));
+
+      const seek = (t) => new Promise((resolve) => {
+        let done = false;
+        const fin = () => { if (done) return; done = true; video.removeEventListener("seeked", fin); clearTimeout(timer); resolve(); };
+        const timer = setTimeout(fin, 3000); // never hang on a stubborn frame
+        video.addEventListener("seeked", fin);
+        video.currentTime = Math.abs(video.currentTime - t) < 1e-3 ? t + 1e-3 : t;
+      });
+
+      for (let i = 0; i < total; i++) {
+        await seek(Math.min(video.duration - 1e-3, i / FPS));
+        ctx.drawImage(video, 0, 0, w, h);
+        quantizeFrame(ctx, gif, w, h, delay);
+        onProgress((i + 1) / total);
+        await tick(); // keep the UI responsive
+      }
+      gif.finish();
+      return gif.bytes();
     }
 
     async function convert(file) {
@@ -150,41 +241,27 @@
       let video;
       try {
         video = await loadVideo(file);
-        const duration = video.duration;
-        if (!isFinite(duration) || duration <= 0) {
-          throw new Error("Couldn't read the video's length.");
-        }
-        // Prime the decoder — some browsers (esp. iOS) need a play tick before
-        // they'll paint frames to a canvas.
-        try { await video.play(); video.pause(); } catch (e) {}
 
         const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
         const w = Math.max(2, Math.round((video.videoWidth * scale) / 2) * 2);
         const h = Math.max(2, Math.round((video.videoHeight * scale) / 2) * 2);
 
-        const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        setStatus("Converting… 0%");
+        const onProgress = (p) => setStatus("Converting… " + Math.round(p * 100) + "%");
 
-        const total = Math.max(1, Math.min(600, Math.floor(duration * FPS)));
-        const delay = Math.round(1000 / FPS);
-        const gif = GIFEncoder();
-
-        for (let i = 0; i < total; i++) {
-          await seek(video, Math.min(duration - 1e-3, i / FPS));
-          ctx.drawImage(video, 0, 0, w, h);
-          const { data } = ctx.getImageData(0, 0, w, h);
-          // Per-frame optimal 256-color palette → sharp, clear output.
-          const palette = quantize(data, 256, { format: "rgb565" });
-          const index = applyPalette(data, palette, "rgb565");
-          gif.writeFrame(index, w, h, { palette, delay });
-          setStatus("Converting… " + Math.round(((i + 1) / total) * 100) + "%");
-          await tick(); // keep the UI responsive
+        let bytes;
+        if (typeof video.requestVideoFrameCallback === "function") {
+          try {
+            bytes = await captureByPlayback(video, w, h, onProgress);
+          } catch (e) {
+            console.warn("Playback capture failed, falling back to seeking.", e);
+            bytes = await captureBySeeking(video, w, h, onProgress);
+          }
+        } else {
+          bytes = await captureBySeeking(video, w, h, onProgress);
         }
 
-        gif.finish();
-        const blob = new Blob([gif.bytes()], { type: "image/gif" });
+        const blob = new Blob([bytes], { type: "image/gif" });
         const url = URL.createObjectURL(blob);
 
         preview.src = url;
@@ -196,9 +273,9 @@
         setStatus("Done — " + (kb > 1024 ? (kb / 1024).toFixed(1) + " MB" : Math.round(kb) + " KB"));
       } catch (err) {
         console.error(err);
-        setStatus("Error: " + (err && err.message ? err.message : err));
+        setStatus(err && err.message ? err.message : String(err));
       } finally {
-        if (video) URL.revokeObjectURL(video.src);
+        if (video) destroyVideo(video);
         pick.classList.remove("busy");
       }
     }
