@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>giffer — video to gif</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1.25rem;
+    padding: 1.5rem;
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0e0f12;
+    color: #e8e8ea;
+    text-align: center;
+  }
+  h1 { margin: 0; font-size: 2rem; letter-spacing: -0.02em; }
+  p.sub { margin: 0; color: #9aa0a6; max-width: 28rem; }
+  label.upload {
+    display: inline-block;
+    padding: 1rem 1.75rem;
+    border: 2px dashed #3a3d44;
+    border-radius: 14px;
+    cursor: pointer;
+    font-weight: 600;
+    transition: border-color .15s, background .15s;
+    background: #16181d;
+  }
+  label.upload:hover { border-color: #6b7280; background: #1b1e24; }
+  label.upload.busy { opacity: .5; pointer-events: none; }
+  input[type=file] { display: none; }
+  #status { min-height: 1.5rem; color: #9aa0a6; font-variant-numeric: tabular-nums; }
+  #result { display: none; flex-direction: column; align-items: center; gap: 1rem; }
+  #result img { max-width: min(90vw, 480px); border-radius: 12px; background: #fff; }
+  a.download {
+    display: inline-block;
+    padding: .85rem 1.5rem;
+    background: #4f8cff;
+    color: #fff;
+    text-decoration: none;
+    border-radius: 12px;
+    font-weight: 600;
+  }
+  small.hint { color: #6b7280; }
+  footer { position: fixed; bottom: .75rem; font-size: .8rem; color: #4b4f57; }
+  footer a { color: #6b7280; }
+</style>
+</head>
+<body>
+  <h1>giffer</h1>
+  <p class="sub">Pick a short video. It's converted to a high-quality GIF right here in your browser — nothing is uploaded to a server.</p>
+
+  <label class="upload" id="pick">
+    <input type="file" id="file" accept="video/*" />
+    Choose a video
+  </label>
+
+  <div id="status"></div>
+
+  <div id="result">
+    <img id="preview" alt="your gif" />
+    <a class="download" id="download" download="giffer.gif">Download GIF</a>
+    <small class="hint">On a phone, long-press the image to save it to your camera roll.</small>
+  </div>
+
+  <footer><a href="https://github.com/djessemann/giffer">source on github</a></footer>
+
+  <script src="coi-serviceworker.js"></script>
+  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
+  <script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
+  <script>
+  (function () {
+    const CORE = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+    const { FFmpeg } = FFmpegWASM;
+    const { fetchFile, toBlobURL } = FFmpegUtil;
+
+    const pick = document.getElementById("pick");
+    const fileInput = document.getElementById("file");
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+    const preview = document.getElementById("preview");
+    const download = document.getElementById("download");
+
+    let ffmpeg = null;
+
+    function setStatus(t) { statusEl.textContent = t; }
+
+    async function ensureLoaded() {
+      if (ffmpeg) return ffmpeg;
+      if (!window.crossOriginIsolated) {
+        // coi-serviceworker reloads the page once to enable this; if we get
+        // here it failed, so bail with a clear message.
+        throw new Error("Couldn't enable the in-browser converter. Reload the page and try again.");
+      }
+      setStatus("Loading converter… (one-time, ~30 MB)");
+      ffmpeg = new FFmpeg();
+      ffmpeg.on("progress", function (e) {
+        if (e.progress >= 0 && e.progress <= 1) {
+          setStatus("Converting… " + Math.round(e.progress * 100) + "%");
+        }
+      });
+      await ffmpeg.load({
+        coreURL: await toBlobURL(CORE + "/ffmpeg-core.js", "text/javascript"),
+        wasmURL: await toBlobURL(CORE + "/ffmpeg-core.wasm", "application/wasm"),
+      });
+      return ffmpeg;
+    }
+
+    async function convert(file) {
+      pick.classList.add("busy");
+      resultEl.style.display = "none";
+      preview.removeAttribute("src");
+      download.removeAttribute("href");
+
+      try {
+        const ff = await ensureLoaded();
+
+        const ext = (file.name.split(".").pop() || "mp4").toLowerCase();
+        const inName = "input." + ext;
+        await ff.writeFile(inName, await fetchFile(file));
+
+        // Two-pass palette conversion: generate an optimal 256-color palette
+        // from the whole clip, then apply it with dithering for clarity.
+        // fps 15 keeps motion smooth; width capped at 640 for sharp but
+        // sensibly-sized output on short clips.
+        const vf = "fps=15,scale='min(640,iw)':-2:flags=lanczos";
+
+        setStatus("Analyzing colors…");
+        await ff.exec([
+          "-i", inName,
+          "-vf", vf + ",palettegen=stats_mode=diff",
+          "-y", "palette.png",
+        ]);
+
+        setStatus("Converting…");
+        await ff.exec([
+          "-i", inName,
+          "-i", "palette.png",
+          "-filter_complex", vf + "[x];[x][1:v]paletteuse=dither=sierra2_4a:diff_mode=rectangle",
+          "-y", "out.gif",
+        ]);
+
+        const data = await ff.readFile("out.gif");
+        const blob = new Blob([data.buffer], { type: "image/gif" });
+        const url = URL.createObjectURL(blob);
+
+        preview.src = url;
+        download.href = url;
+        download.download = (file.name.replace(/\.[^.]+$/, "") || "giffer") + ".gif";
+        resultEl.style.display = "flex";
+
+        const kb = blob.size / 1024;
+        setStatus("Done — " + (kb > 1024 ? (kb / 1024).toFixed(1) + " MB" : Math.round(kb) + " KB"));
+
+        // clean up the virtual filesystem for the next run
+        try { await ff.deleteFile(inName); await ff.deleteFile("palette.png"); await ff.deleteFile("out.gif"); } catch (e) {}
+      } catch (err) {
+        console.error(err);
+        setStatus("Error: " + (err && err.message ? err.message : err));
+      } finally {
+        pick.classList.remove("busy");
+      }
+    }
+
+    fileInput.addEventListener("change", function () {
+      const f = fileInput.files && fileInput.files[0];
+      if (f) convert(f);
+      fileInput.value = ""; // allow re-picking the same file
+    });
+  })();
+  </script>
+</body>
+</html>
