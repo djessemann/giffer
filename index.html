@@ -51,9 +51,38 @@
   small.hint { color: #6b7280; }
   footer { position: fixed; bottom: .75rem; font-size: .8rem; color: #4b4f57; }
   footer a { color: #6b7280; }
+  #reset {
+    position: fixed;
+    top: max(.85rem, env(safe-area-inset-top));
+    right: max(.85rem, env(safe-area-inset-right));
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 2.75rem;
+    height: 2.75rem;
+    padding: 0;
+    border: 1px solid #2a2d34;
+    border-radius: 50%;
+    background: #16181d;
+    color: #e8e8ea;
+    cursor: pointer;
+    transition: border-color .15s, background .15s, transform .15s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #reset:hover { border-color: #4f8cff; background: #1b1e24; }
+  #reset:active { transform: scale(.92); }
+  #reset svg { width: 1.4rem; height: 1.4rem; display: block; }
 </style>
 </head>
 <body>
+  <button id="reset" type="button" title="Start over" aria-label="Start over">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 12a9 9 0 1 0 3-6.7" />
+      <path d="M3 3v4h4" />
+    </svg>
+  </button>
+
   <h1>giffer</h1>
   <p class="sub">Convert a video to a GIF.</p>
 
@@ -106,6 +135,11 @@
     const resultEl = document.getElementById("result");
     const preview = document.getElementById("preview");
     const download = document.getElementById("download");
+    const reset = document.getElementById("reset");
+
+    // Reload to a clean state — handy once a GIF is made, especially when
+    // giffer is installed as a standalone web app with no browser chrome.
+    reset.addEventListener("click", () => location.reload());
 
     const setStatus = (t) => { statusEl.textContent = t; };
     const tick = () => new Promise((r) => requestAnimationFrame(() => r()));
@@ -268,6 +302,7 @@
         download.href = url;
         download.download = (file.name.replace(/\.[^.]+$/, "") || "giffer") + ".gif";
         resultEl.style.display = "flex";
+        reset.style.display = "flex";
 
         const kb = blob.size / 1024;
         setStatus("Done — " + (kb > 1024 ? (kb / 1024).toFixed(1) + " MB" : Math.round(kb) + " KB"));
